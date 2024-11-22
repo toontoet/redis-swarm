@@ -1,14 +1,19 @@
 #!/bin/sh
 
+# Function to fetch all Redis task IPs
+get_redis_nodes() {
+  getent hosts tasks.redis | awk '{ print $1 }'
+}
+
 # Wait for other Redis nodes to become available
 echo "Waiting for Redis nodes to be ready..."
 sleep 10
 
-# Get the IPs of the Redis replicas
-REDIS_NODES=$(getent hosts tasks.redis | awk '{ print $1 }')
+# Get the IP of the current container
+SELF_IP=$(hostname -i)
 
-# Get the current cluster configuration
-CURRENT_NODES=$(redis-cli -c cluster nodes | awk '{ print $2 }' | grep -oE '^[^@]+' | sort)
+# Fetch all Redis task IPs
+REDIS_NODES=$(get_redis_nodes)
 
 # Define function to create the cluster
 create_cluster() {
@@ -24,6 +29,7 @@ create_cluster() {
 # Define function to add new nodes to the cluster
 add_nodes() {
   echo "Adding new nodes to the cluster..."
+  CURRENT_NODES=$(redis-cli -c cluster nodes | awk '{ print $2 }' | grep -oE '^[^@]+')
   for NODE in $REDIS_NODES; do
     if ! echo "$CURRENT_NODES" | grep -q "$NODE:6379"; then
       echo "Adding $NODE to the cluster..."
@@ -35,6 +41,7 @@ add_nodes() {
 # Define function to remove nodes from the cluster
 remove_nodes() {
   echo "Removing missing nodes from the cluster..."
+  CURRENT_NODES=$(redis-cli -c cluster nodes | awk '{ print $2 }' | grep -oE '^[^@]+')
   for NODE in $CURRENT_NODES; do
     if ! echo "$REDIS_NODES" | grep -q "${NODE%%:*}"; then
       echo "Removing $NODE from the cluster..."
@@ -43,18 +50,22 @@ remove_nodes() {
   done
 }
 
-# Check if this is the first container starting the cluster
-if [ "$(hostname)" = "$(getent hosts tasks.redis | awk '{ print $2 }' | head -n 1)" ]; then
-  if [ -z "$CURRENT_NODES" ]; then
-    # If no cluster exists, create one
+# Check if this is the primary container based on IP
+if [ "$SELF_IP" = "$(echo "$REDIS_NODES" | head -n 1)" ]; then
+  echo "This container is the primary node."
+
+  # Check if the cluster is already initialized
+  CLUSTER_INFO=$(redis-cli -c cluster info 2>/dev/null | grep "cluster_state:ok")
+  if [ -z "$CLUSTER_INFO" ]; then
+    echo "Cluster not initialized. Creating cluster..."
     create_cluster
   else
-    # If a cluster exists, update it with new nodes
+    echo "Cluster already initialized. Checking for updates..."
     add_nodes
     remove_nodes
   fi
 else
-  echo "Not the primary container. Skipping cluster management."
+  echo "This container is not the primary node. Skipping cluster management."
 fi
 
 # Start Redis server
